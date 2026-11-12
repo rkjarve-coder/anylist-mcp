@@ -17,6 +17,11 @@ Item.prototype._encode = function() {
   });
 };
 
+// Every getRecipes/getMealPlanningCalendarEvents/_getUserData(true) call in
+// anylist-js downloads the whole account, and AnyList rate-limits those
+// downloads. Reuse the snapshot we already have for this long instead.
+const USER_DATA_TTL_MS = 5 * 60 * 1000;
+
 class AnyListClient {
   /**
    * @param {{ username?: string, password?: string, defaultListName?: string }} [credentials]
@@ -29,6 +34,24 @@ class AnyListClient {
     this._username = username || null;
     this._password = password || null;
     this.defaultListName = defaultListName || null;
+    this._userDataFetchedAt = 0;
+  }
+
+  /**
+   * Run a library call that reads the account snapshot, re-downloading the
+   * whole account only when the snapshot is older than USER_DATA_TTL_MS.
+   * @param {(refresh: boolean) => Promise<any>} fn
+   */
+  async _withSnapshot(fn) {
+    const refresh = Date.now() - this._userDataFetchedAt > USER_DATA_TTL_MS;
+    const result = await fn(refresh);
+    if (refresh) this._userDataFetchedAt = Date.now();
+    return result;
+  }
+
+  /** Force the next snapshot read to re-download (call after a write). */
+  _invalidateSnapshot() {
+    this._userDataFetchedAt = 0;
   }
 
   async connect(listName = null) {
@@ -67,6 +90,7 @@ class AnyListClient {
         console.error('Successfully authenticated with AnyList');
 
         await this.client.getLists();
+        this._userDataFetchedAt = Date.now();
       }
 
       // Find the target list
@@ -296,7 +320,7 @@ class AnyListClient {
       throw new Error('Not connected. Call connect() first.');
     }
     try {
-      const recipes = await this.client.getRecipes();
+      const recipes = await this._withSnapshot(r => this.client.getRecipes(r));
       let results = recipes.map(r => ({
         identifier: r.identifier,
         name: r.name,
@@ -325,7 +349,7 @@ class AnyListClient {
       throw new Error('Not connected. Call connect() first.');
     }
     try {
-      const recipes = await this.client.getRecipes();
+      const recipes = await this._withSnapshot(r => this.client.getRecipes(r));
       const recipe = recipes.find(r => r.name && r.name.toLowerCase() === recipeName.toLowerCase());
       if (!recipe) {
         throw new Error(`Recipe "${recipeName}" not found`);
@@ -386,6 +410,7 @@ class AnyListClient {
         recipe.isNewRecipeFromWebImport = true;
         recipe.creationTimestamp = Date.now() / 1000;
         await recipe.save();
+        this._invalidateSnapshot();
         console.error(`Imported recipe from URL (native): ${recipe.name}`);
 
         return {
@@ -460,6 +485,7 @@ class AnyListClient {
       }
       const recipe = await this.client.createRecipe(recipeObj);
       await recipe.save();
+      this._invalidateSnapshot();
       console.error(`Created recipe: ${recipe.name}`);
       return { identifier: recipe.identifier, name: recipe.name };
     } catch (error) {
@@ -472,12 +498,13 @@ class AnyListClient {
       throw new Error('Not connected. Call connect() first.');
     }
     try {
-      const recipes = await this.client.getRecipes();
+      const recipes = await this._withSnapshot(r => this.client.getRecipes(r));
       const recipe = recipes.find(r => r.name && r.name.toLowerCase() === recipeName.toLowerCase());
       if (!recipe) {
         throw new Error(`Recipe "${recipeName}" not found`);
       }
       await recipe.delete();
+      this._invalidateSnapshot();
       console.error(`Deleted recipe: ${recipe.name}`);
     } catch (error) {
       throw new Error(`Failed to delete recipe: ${error.message}`);
@@ -491,7 +518,7 @@ class AnyListClient {
       throw new Error('Not connected. Call connect() first.');
     }
     try {
-      const events = await this.client.getMealPlanningCalendarEvents();
+      const events = await this._withSnapshot(r => this.client.getMealPlanningCalendarEvents(r));
       return events.map(e => ({
         identifier: e.identifier,
         date: e.date instanceof Date ? e.date.toISOString().slice(0, 10) : String(e.date),
@@ -512,7 +539,7 @@ class AnyListClient {
       throw new Error('Not connected. Call connect() first.');
     }
     try {
-      await this.client.getMealPlanningCalendarEvents();
+      await this._withSnapshot(r => this.client.getMealPlanningCalendarEvents(r));
       return (this.client.mealPlanningCalendarEventLabels || []).map(l => ({
         identifier: l.identifier,
         name: l.name,
@@ -536,6 +563,7 @@ class AnyListClient {
       if (details) eventObj.details = details;
       const event = await this.client.createEvent(eventObj);
       await event.save();
+      this._invalidateSnapshot();
       console.error(`Created meal plan event for ${date}`);
       return { identifier: event.identifier, date: date };
     } catch (error) {
@@ -548,12 +576,13 @@ class AnyListClient {
       throw new Error('Not connected. Call connect() first.');
     }
     try {
-      const events = await this.client.getMealPlanningCalendarEvents();
+      const events = await this._withSnapshot(r => this.client.getMealPlanningCalendarEvents(r));
       const event = events.find(e => e.identifier === eventId);
       if (!event) {
         throw new Error(`Meal plan event "${eventId}" not found`);
       }
       await event.delete();
+      this._invalidateSnapshot();
       console.error(`Deleted meal plan event: ${eventId}`);
     } catch (error) {
       throw new Error(`Failed to delete meal plan event: ${error.message}`);
@@ -607,9 +636,9 @@ class AnyListClient {
       throw new Error('Not connected. Call connect() first.');
     }
     try {
-      const userData = await this.client._getUserData(true);
+      const userData = await this._withSnapshot(r => this.client._getUserData(r));
       const collections = userData.recipeDataResponse.recipeCollections || [];
-      const recipes = await this.client.getRecipes();
+      const recipes = await this.client.getRecipes(false);
       return collections.map(c => ({
         identifier: c.identifier,
         name: c.name,
@@ -631,7 +660,7 @@ class AnyListClient {
     try {
       const recipeIds = [];
       if (recipeNames.length > 0) {
-        const recipes = await this.client.getRecipes();
+        const recipes = await this._withSnapshot(r => this.client.getRecipes(r));
         for (const rName of recipeNames) {
           const r = recipes.find(r => r.name && r.name.toLowerCase() === rName.toLowerCase());
           if (r) recipeIds.push(r.identifier);
@@ -639,6 +668,7 @@ class AnyListClient {
       }
       const collection = this.client.createRecipeCollection({ name, recipeIds });
       await collection.save();
+      this._invalidateSnapshot();
       console.error(`Created recipe collection: ${name}`);
       return { identifier: collection.identifier, name: collection.name };
     } catch (error) {
@@ -651,12 +681,13 @@ class AnyListClient {
       throw new Error('Not connected. Call connect() first.');
     }
     try {
-      const userData = await this.client._getUserData(true);
+      const userData = await this._withSnapshot(r => this.client._getUserData(r));
       const collections = userData.recipeDataResponse.recipeCollections || [];
       const raw = collections.find(c => c.name && c.name.toLowerCase() === name.toLowerCase());
       if (!raw) throw new Error(`Recipe collection "${name}" not found`);
       const collection = this.client.createRecipeCollection(raw);
       await collection.delete();
+      this._invalidateSnapshot();
       console.error(`Deleted recipe collection: ${name}`);
     } catch (error) {
       throw new Error(`Failed to delete recipe collection: ${error.message}`);
@@ -676,6 +707,7 @@ class AnyListClient {
     }
     this.client = null;
     this.targetList = null;
+    this._userDataFetchedAt = 0;
   }
 }
 
